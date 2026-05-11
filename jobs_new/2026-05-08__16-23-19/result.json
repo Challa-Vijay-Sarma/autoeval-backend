@@ -1,0 +1,37 @@
+{
+    "id": "7445aa1f-381c-4aaa-9835-138446354f2d",
+    "started_at": "2026-05-08T16:23:19.650420",
+    "finished_at": "2026-05-08T16:23:26.850258",
+    "n_total_trials": 10,
+    "stats": {
+        "n_trials": 10,
+        "n_errors": 10,
+        "evals": {
+            "terminus-2__gpt-5.2__benchmark": {
+                "n_trials": 0,
+                "n_errors": 10,
+                "metrics": [
+                    {
+                        "mean": 0.0
+                    }
+                ],
+                "pass_at_k": {},
+                "reward_stats": {},
+                "exception_stats": {
+                    "RuntimeError": [
+                        "chess-best-move__bJWxg4Y",
+                        "break-filter-js-from-html__f3rwJbJ",
+                        "cancel-async-tasks__yGZAVwN",
+                        "adaptive-rejection-sampler__DpqShep",
+                        "bn-fit-modify__igys5ST",
+                        "build-pmars__tCqYbRe",
+                        "build-pov-ray__Gz28CrT",
+                        "circuit-fibsqrt__Ghd4Fj3",
+                        "build-cython-ext__ZAAwXYz",
+                        "caffe-cifar-10__zfcefmy"
+                    ]
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,4 @@
+Trial cancel-async-tasks__yGZAVwN failed: Docker compose command failed for environment terminal-bench/cancel-async-tasks. Command: docker compose --project-name cancel-async-tasks__ygzavwn --project-directory /Users/vijaychalla/Documents/Autoeval-pipeline/benchmark/cancel-async-tasks/environment -f /Users/vijaychalla/.local/share/uv/tools/harbor/lib/python3.13/site-packages/harbor/environments/docker/docker-compose-base.yaml -f /Users/vijaychalla/.local/share/uv/tools/harbor/lib/python3.13/site-packages/harbor/environments/docker/docker-compose-prebuilt.yaml up --detach --wait. Return code: 1. Stdout:  Network cancel-async-tasks__ygzavwn_default Creating 
+ Network cancel-async-tasks__ygzavwn_default Error Error response from daemon: all predefined address pools have been fully subnetted
+failed to create network cancel-async-tasks__ygzavwn_default: Error response from daemon: all predefined address pools have been fully subnetted
+. Stderr: None. 

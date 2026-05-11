@@ -1,0 +1,4 @@
+Trial build-pov-ray__Gz28CrT failed: Docker compose command failed for environment terminal-bench/build-pov-ray. Command: docker compose --project-name build-pov-ray__gz28crt --project-directory /Users/vijaychalla/Documents/Autoeval-pipeline/benchmark/build-pov-ray/environment -f /Users/vijaychalla/.local/share/uv/tools/harbor/lib/python3.13/site-packages/harbor/environments/docker/docker-compose-base.yaml -f /Users/vijaychalla/.local/share/uv/tools/harbor/lib/python3.13/site-packages/harbor/environments/docker/docker-compose-prebuilt.yaml up --detach --wait. Return code: 1. Stdout:  Network build-pov-ray__gz28crt_default Creating 
+ Network build-pov-ray__gz28crt_default Error Error response from daemon: all predefined address pools have been fully subnetted
+failed to create network build-pov-ray__gz28crt_default: Error response from daemon: all predefined address pools have been fully subnetted
+. Stderr: None. 

@@ -1,0 +1,11 @@
+.venv/
+.git/
+storage/
+jobs_new/
+benchmark/
+__pycache__/
+*.pyc
+.DS_Store
+frontend/node_modules/
+frontend/dist/
+.env
