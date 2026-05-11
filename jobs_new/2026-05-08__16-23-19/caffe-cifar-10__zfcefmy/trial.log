@@ -1,4 +1,0 @@
-Trial caffe-cifar-10__zfcefmy failed: Docker compose command failed for environment terminal-bench/caffe-cifar-10. Command: docker compose --project-name caffe-cifar-10__zfcefmy --project-directory /Users/vijaychalla/Documents/Autoeval-pipeline/benchmark/caffe-cifar-10/environment -f /Users/vijaychalla/.local/share/uv/tools/harbor/lib/python3.13/site-packages/harbor/environments/docker/docker-compose-base.yaml -f /Users/vijaychalla/.local/share/uv/tools/harbor/lib/python3.13/site-packages/harbor/environments/docker/docker-compose-prebuilt.yaml up --detach --wait. Return code: 1. Stdout:  Network caffe-cifar-10__zfcefmy_default Creating 
- Network caffe-cifar-10__zfcefmy_default Error Error response from daemon: all predefined address pools have been fully subnetted
-failed to create network caffe-cifar-10__zfcefmy_default: Error response from daemon: all predefined address pools have been fully subnetted
-. Stderr: None. 

@@ -1,4 +1,0 @@
-Trial build-pmars__tCqYbRe failed: Docker compose command failed for environment terminal-bench/build-pmars. Command: docker compose --project-name build-pmars__tcqybre --project-directory /Users/vijaychalla/Documents/Autoeval-pipeline/benchmark/build-pmars/environment -f /Users/vijaychalla/.local/share/uv/tools/harbor/lib/python3.13/site-packages/harbor/environments/docker/docker-compose-base.yaml -f /Users/vijaychalla/.local/share/uv/tools/harbor/lib/python3.13/site-packages/harbor/environments/docker/docker-compose-prebuilt.yaml up --detach --wait. Return code: 1. Stdout:  Network build-pmars__tcqybre_default Creating 
- Network build-pmars__tcqybre_default Error Error response from daemon: all predefined address pools have been fully subnetted
-failed to create network build-pmars__tcqybre_default: Error response from daemon: all predefined address pools have been fully subnetted
-. Stderr: None. 
