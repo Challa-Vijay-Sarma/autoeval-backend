@@ -31,6 +31,13 @@ class Settings(BaseSettings):
     # If unset, the backend retries with appendable uploads after the first 400 from GCS.
     gcs_force_appendable: bool = False
 
+    # Parallelism — how many episodes evaluate concurrently inside a single run.
+    # Each thread holds one OpenAI request at a time. Tune down if you hit TPM caps.
+    max_parallel_episodes: int = 10
+    # Parallelism for ingest writes (one bucket object per write). Higher = faster
+    # zip → bucket extraction on slow buckets (Rapid / HNS).
+    ingest_parallelism: int = 16
+
     # Auth
     api_token: str = ""  # empty -> open access
 

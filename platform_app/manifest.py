@@ -77,7 +77,8 @@ def new_manifest(
         "task_name": task_name,
         "uploaded_filename": uploaded_filename,
         "model": model,
-        "status": "queued",
+        "status": "queued",  # queued | running | pausing | paused | done | failed
+        "pause_requested": False,
         "created_at": utc_now_iso(),
         "started_at": None,
         "finished_at": None,
@@ -123,6 +124,7 @@ def index_entry_from_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
         "uploaded_filename": manifest["uploaded_filename"],
         "model": manifest["model"],
         "status": manifest["status"],
+        "pause_requested": manifest.get("pause_requested", False),
         "created_at": manifest["created_at"],
         "started_at": manifest.get("started_at"),
         "finished_at": manifest.get("finished_at"),

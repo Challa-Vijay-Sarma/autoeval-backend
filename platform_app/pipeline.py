@@ -11,8 +11,10 @@ import csv
 import io
 import json
 import logging
+import threading
 import traceback
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -33,21 +35,72 @@ FAILURE_DIRS = {"Failure_trajectories", "failure_trajectories"}
 
 
 # ----------------------------------------------------------------------------
+# Pause / resume primitives
+# ----------------------------------------------------------------------------
+# In-process pause flags. Survives until uvicorn restarts; the persistent
+# pause_requested flag on the manifest is the source of truth across restarts.
+_pause_events: dict[str, threading.Event] = {}
+_pause_events_lock = threading.Lock()
+
+# Per-run lock so two `process_run` invocations for the same run can't race
+# (e.g. an immediate resume click while the prior worker is still tearing down).
+_run_locks: dict[str, threading.Lock] = {}
+_run_locks_lock = threading.Lock()
+
+
+def _get_pause_event(run_id: str) -> threading.Event:
+    with _pause_events_lock:
+        ev = _pause_events.get(run_id)
+        if ev is None:
+            ev = threading.Event()
+            _pause_events[run_id] = ev
+        return ev
+
+
+def _get_run_lock(run_id: str) -> threading.Lock:
+    with _run_locks_lock:
+        lock = _run_locks.get(run_id)
+        if lock is None:
+            lock = threading.Lock()
+            _run_locks[run_id] = lock
+        return lock
+
+
+def request_pause(run_id: str) -> None:
+    """Signal the worker for this run to stop scheduling new episodes."""
+    _get_pause_event(run_id).set()
+
+
+def request_resume(run_id: str) -> None:
+    """Clear a pause flag so the worker can start scheduling episodes again."""
+    _get_pause_event(run_id).clear()
+
+
+def is_paused(run_id: str) -> bool:
+    return _get_pause_event(run_id).is_set()
+
+
+# ----------------------------------------------------------------------------
 # Ingest: unpack uploaded zip into storage
 # ----------------------------------------------------------------------------
 def ingest_zip(storage: StorageBackend, run_id: str, zip_bytes: bytes) -> dict[str, list[str]]:
     """Save the zip and unpack the trajectories. Returns dict of categories ->
-    list of episode names, each containing a trajectory."""
+    list of episode names, each containing a trajectory.
+
+    Writes are performed in parallel (settings.ingest_parallelism). On slow
+    buckets (Rapid / HNS appendable) this is the difference between ~12 min
+    and ~1-2 min for a zip of ~500 small objects.
+    """
     run_pfx = manifest.run_prefix(run_id)
     storage.put_bytes(f"{run_pfx}/original.zip", zip_bytes, content_type="application/zip")
 
     discovered: dict[str, list[tuple[str, str]]] = {GOLDEN_CATEGORY: [], FAILURE_CATEGORY: []}
+    writes: list[tuple[str, bytes]] = []  # (key, data)
 
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
         for info in zf.infolist():
             if info.is_dir():
                 continue
-            # normalize path
             parts = Path(info.filename).parts
             if not parts:
                 continue
@@ -65,17 +118,29 @@ def ingest_zip(storage: StorageBackend, run_id: str, zip_bytes: bytes) -> dict[s
                     break
             if category is None or seg_idx is None:
                 continue
-            # need at least: …/<category>/<episode>/<file>
             if seg_idx + 2 >= len(parts):
                 continue
             episode_name = parts[seg_idx + 1]
-            sub_path = "/".join(parts[seg_idx + 1:])  # e.g. "episode1/agent/trajectory.json"
+            sub_path = "/".join(parts[seg_idx + 1:])
 
-            # save the file to extracted/<category>/<sub_path>
             key = f"{run_pfx}/extracted/{parts[seg_idx]}/{sub_path}"
             with zf.open(info) as src:
-                storage.put_bytes(key, src.read())
+                writes.append((key, src.read()))
             discovered[category].append((episode_name, key))
+
+    # Write objects in parallel. Each one is independent (distinct key) so
+    # they cannot contend; the bucket happily handles parallel streams.
+    parallelism = max(1, get_settings().ingest_parallelism)
+    log.info("ingest: writing %d objects with parallelism=%d", len(writes), parallelism)
+
+    def _put(item: tuple[str, bytes]) -> None:
+        k, data = item
+        storage.put_bytes(k, data)
+
+    if writes:
+        with ThreadPoolExecutor(max_workers=parallelism) as pool:
+            for _ in pool.map(_put, writes):
+                pass
 
     # group by episode and select the trajectory file per episode
     out: dict[str, list[dict[str, str]]] = {GOLDEN_CATEGORY: [], FAILURE_CATEGORY: []}
@@ -162,58 +227,142 @@ def load_trajectory(storage: StorageBackend, key: str) -> dict[str, Any]:
 # Worker entrypoint
 # ----------------------------------------------------------------------------
 def process_run(run_id: str) -> None:
-    """Run the full pipeline for one run. Idempotent on episode level."""
-    storage = get_storage()
-    settings = get_settings()
+    """Run the pipeline for one run. Idempotent at the episode level.
 
-    try:
-        m = manifest.read_manifest(storage, run_id)
-    except Exception as e:  # noqa: BLE001
-        log.exception("could not load manifest for %s: %s", run_id, e)
+    Behaviour:
+      - Per-run lock: only one process_run for the same run_id at a time.
+      - Crash recovery: any episode left in 'running' from a prior worker is
+        reset to 'pending' before scheduling.
+      - Pause: if the in-memory pause event or the manifest's pause_requested
+        flag is set, workers skip pending episodes and the run status flips
+        to 'paused' (not 'done') at the end.
+    """
+    run_lock = _get_run_lock(run_id)
+    if not run_lock.acquire(blocking=False):
+        log.warning("process_run already in progress for %s; skipping", run_id)
         return
 
-    m["status"] = "running"
-    m["started_at"] = manifest.utc_now_iso()
-    manifest.write_manifest(storage, m)
-    manifest.upsert_index_entry(storage, manifest.index_entry_from_manifest(m))
-
     try:
-        client = evaluators.make_client(settings.openai_api_key)
-        for ep in m["episodes"]:
-            if ep["status"] == "done":
-                continue
-            ep["status"] = "running"
-            ep["started_at"] = manifest.utc_now_iso()
-            ep["error_message"] = ""
-            manifest.write_manifest(storage, m)
+        storage = get_storage()
+        settings = get_settings()
 
-            try:
-                _process_episode(storage, client, m, ep, settings.openai_model, settings.openai_max_tokens)
-                ep["status"] = "done"
-            except Exception as e:  # noqa: BLE001
-                log.exception("episode %s failed: %s", ep["episode_id"], e)
-                ep["status"] = "error"
-                ep["error_message"] = f"{type(e).__name__}: {e}"
-            finally:
-                ep["finished_at"] = manifest.utc_now_iso()
-                manifest.write_manifest(storage, m)
-                manifest.upsert_index_entry(storage, manifest.index_entry_from_manifest(m))
+        try:
+            m = manifest.read_manifest(storage, run_id)
+        except Exception as e:  # noqa: BLE001
+            log.exception("could not load manifest for %s: %s", run_id, e)
+            return
 
-        # All episodes processed — write summary spreadsheets
-        _write_summaries(storage, m)
+        pause_event = _get_pause_event(run_id)
+        # Reconcile in-process pause flag with the persisted flag (e.g. after
+        # a uvicorn restart while paused).
+        if m.get("pause_requested"):
+            pause_event.set()
+        else:
+            pause_event.clear()
 
-        m["status"] = "done" if any(ep["status"] == "done" for ep in m["episodes"]) else "failed"
-        if not m["episodes"]:
-            m["status"] = "failed"
-            m["error_message"] = "no episodes discovered in zip"
-    except Exception as e:  # noqa: BLE001
-        log.exception("run %s failed: %s", run_id, e)
-        m["status"] = "failed"
-        m["error_message"] = f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
-    finally:
-        m["finished_at"] = manifest.utc_now_iso()
+        # Crash recovery: any "running" episode left over from a prior worker
+        # is stale (the run lock guarantees we're alone now). Reset to pending.
+        for ep in m.get("episodes", []):
+            if ep["status"] == "running":
+                ep["status"] = "pending"
+                if not ep.get("error_message"):
+                    ep["error_message"] = "reset after worker restart"
+
+        m["status"] = "running"
+        if not m.get("started_at"):
+            m["started_at"] = manifest.utc_now_iso()
         manifest.write_manifest(storage, m)
         manifest.upsert_index_entry(storage, manifest.index_entry_from_manifest(m))
+
+        completed_normally = False
+        try:
+            client = evaluators.make_client(settings.openai_api_key)
+            todo = [ep for ep in m["episodes"] if ep["status"] != "done"]
+            parallelism = max(1, settings.max_parallel_episodes)
+            log.info("processing %d episode(s) with parallelism=%d", len(todo), parallelism)
+
+            manifest_lock = threading.Lock()
+
+            def _run_one(ep: dict[str, Any]) -> None:
+                # If pause was requested before we even started this episode,
+                # don't begin — leave it pending so resume can pick it up.
+                if pause_event.is_set():
+                    return
+                with manifest_lock:
+                    ep["status"] = "running"
+                    ep["started_at"] = manifest.utc_now_iso()
+                    ep["error_message"] = ""
+                    manifest.write_manifest(storage, m)
+
+                try:
+                    _process_episode(
+                        storage, client, m, ep,
+                        settings.openai_model, settings.openai_max_tokens,
+                    )
+                    ep["status"] = "done"
+                except Exception as e:  # noqa: BLE001
+                    log.exception("episode %s failed: %s", ep["episode_id"], e)
+                    ep["status"] = "error"
+                    ep["error_message"] = f"{type(e).__name__}: {e}"
+                finally:
+                    with manifest_lock:
+                        ep["finished_at"] = manifest.utc_now_iso()
+                        manifest.write_manifest(storage, m)
+                        manifest.upsert_index_entry(storage, manifest.index_entry_from_manifest(m))
+
+            if todo and not pause_event.is_set():
+                # If pause is set partway, reflect that in the status promptly
+                # so the UI shows "pausing" while in-flight episodes wrap up.
+                pausing_announced = False
+                with ThreadPoolExecutor(max_workers=parallelism) as pool:
+                    futures = [pool.submit(_run_one, ep) for ep in todo]
+                    for f in as_completed(futures):
+                        try:
+                            f.result()
+                        except Exception:  # noqa: BLE001
+                            log.exception("unexpected error from episode task")
+                        if pause_event.is_set() and not pausing_announced:
+                            with manifest_lock:
+                                if m["status"] == "running":
+                                    m["status"] = "pausing"
+                                    manifest.write_manifest(storage, m)
+                                    manifest.upsert_index_entry(
+                                        storage, manifest.index_entry_from_manifest(m)
+                                    )
+                            pausing_announced = True
+
+            # Decide terminal status for this invocation
+            has_pending = any(ep["status"] == "pending" for ep in m["episodes"])
+            if pause_event.is_set() and has_pending:
+                # Paused with work remaining — do not write summaries yet.
+                m["status"] = "paused"
+            else:
+                _write_summaries(storage, m)
+                if not m["episodes"]:
+                    m["status"] = "failed"
+                    m["error_message"] = "no episodes discovered in zip"
+                elif any(ep["status"] == "done" for ep in m["episodes"]):
+                    m["status"] = "done"
+                else:
+                    m["status"] = "failed"
+            completed_normally = True
+        except Exception as e:  # noqa: BLE001
+            log.exception("run %s failed: %s", run_id, e)
+            m["status"] = "failed"
+            m["error_message"] = f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
+        finally:
+            # Only stamp finished_at if the run is truly terminal
+            # (paused runs may still be resumed later).
+            if m.get("status") in ("done", "failed"):
+                m["finished_at"] = manifest.utc_now_iso()
+            manifest.write_manifest(storage, m)
+            manifest.upsert_index_entry(storage, manifest.index_entry_from_manifest(m))
+            if completed_normally and m.get("status") != "paused":
+                # Clear the in-process pause flag for terminal runs so we
+                # don't keep stale state in memory forever.
+                pause_event.clear()
+    finally:
+        run_lock.release()
 
 
 def _process_episode(

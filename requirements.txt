@@ -10,3 +10,6 @@ google-cloud-storage>=3.10
 google-crc32c>=1.5
 # Required for Storage gRPC v2 (appendable / zonal bucket writes); provides google.iam.v1.*
 grpc-google-iam-v1>=0.13
+# gRPC runtime for the appendable / Rapid / HNS bucket code path in platform_app.storage
+grpcio>=1.60
+grpcio-status>=1.60
