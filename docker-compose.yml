@@ -1,0 +1,40 @@
+services:
+  postgres:
+    image: postgres:15
+    container_name: autoeval-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: autoeval_user
+      POSTGRES_PASSWORD: StrongPassword123
+      POSTGRES_DB: autoeval
+    # Host port 5433 -> container 5432 (5432 is already in use on the host).
+    # Backend container talks to it as `postgres:5432` via the compose network regardless.
+    ports:
+      - "5433:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U autoeval_user -d autoeval"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build: .
+    container_name: autoeval-backend
+    restart: unless-stopped
+    env_file: .env
+    # Mount the GCP service-account JSON read-only and re-point GOOGLE_APPLICATION_CREDENTIALS
+    # at the in-container path. (.env's host path doesn't exist inside the container.)
+    volumes:
+      - /Users/vijaychalla/Documents/secrets:/secrets:ro
+    environment:
+      GOOGLE_APPLICATION_CREDENTIALS: /secrets/deccan-dev-dc545908c262.json
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  pg_data:

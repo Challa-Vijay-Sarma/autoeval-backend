@@ -1,18 +1,35 @@
-"""REST API routes."""
+"""REST API routes (Postgres-backed).
+
+Response shapes are unchanged from the GCS-only version — see
+`serializers.py` for the field-for-field translation from ORM objects to the
+old `index.json` / `manifest.json` shapes the frontend expects.
+"""
 
 from __future__ import annotations
 
+import io
 import logging
+import re
 import uuid
+import zipfile
 from typing import Any
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Header, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import Response
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from . import manifest, pipeline
+from . import pipeline, serializers
 from .config import Settings, get_settings
-from .storage import get_storage
+from .db import get_db, sync_session
+from .repositories import (
+    EpisodesRepository,
+    EpisodesRepositoryAsync,
+    NewEpisode,
+    RunsRepository,
+    RunsRepositoryAsync,
+)
+from .storage import get_storage, key_from_uri, storage_uri_for
 
 
 log = logging.getLogger("autoeval.api")
@@ -24,10 +41,29 @@ def require_token(
     authorization: str | None = Header(default=None),
 ) -> None:
     if not settings.api_token:
-        return  # auth disabled
+        return
     expected = f"Bearer {settings.api_token}"
     if authorization != expected:
         raise HTTPException(status_code=401, detail="invalid or missing bearer token")
+
+
+_FILENAME_SAFE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _safe_filename(name: str, *, fallback: str = "episode") -> str:
+    """Sanitize a name for use in a Content-Disposition or zip entry path.
+
+    Strips path separators and any non-[A-Za-z0-9._-] runs, collapses to "_".
+    """
+    cleaned = _FILENAME_SAFE.sub("_", name).strip("._-")
+    return cleaned or fallback
+
+
+def _coerce_run_uuid(run_id: str) -> uuid.UUID:
+    try:
+        return uuid.UUID(run_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail="run not found") from e
 
 
 @router.post("/runs", dependencies=[Depends(require_token)])
@@ -36,158 +72,320 @@ async def create_run(
     file: UploadFile = File(...),
     settings: Settings = Depends(get_settings),
 ) -> dict[str, Any]:
+    """Create a run and kick off the background worker.
+
+    Uses a sync session throughout — the bulk insert + recompute + status
+    transitions are easier to reason about transactionally, and we're already
+    offloading the zip ingest to a worker thread.
+    """
     if not file.filename or not file.filename.lower().endswith(".zip"):
         raise HTTPException(status_code=400, detail="must upload a .zip file")
     zip_bytes = await file.read()
     if not zip_bytes:
         raise HTTPException(status_code=400, detail="empty upload")
 
-    run_id = uuid.uuid4().hex
+    run_id = uuid.uuid4()
     task_name = file.filename.rsplit(".", 1)[0]
     storage = get_storage(settings)
 
-    # Build the manifest before unzipping so the row appears in the index immediately.
-    m = manifest.new_manifest(run_id, task_name, file.filename, settings.openai_model)
-    manifest.write_manifest(storage, m)
-    manifest.upsert_index_entry(storage, manifest.index_entry_from_manifest(m))
+    # 1. Persist the run as 'queued' so it shows up in /api/runs immediately.
+    with sync_session() as s:
+        RunsRepository(s).create(
+            run_id=run_id,
+            task_name=task_name,
+            uploaded_filename=file.filename,
+            model=settings.openai_model,
+        )
 
-    # Ingest in a worker thread so the event loop (and /api/health, /api/runs
-    # polling) stay responsive while ~500 small bucket writes happen.
+    # 2. Unpack the zip (slow; thread pool keeps the event loop free).
     try:
         discovered = await run_in_threadpool(pipeline.ingest_zip, storage, run_id, zip_bytes)
     except Exception as e:  # noqa: BLE001
         log.exception("ingest failed for %s", run_id)
-        m["status"] = "failed"
-        m["error_message"] = f"ingest failed: {type(e).__name__}: {e}"
-        m["finished_at"] = manifest.utc_now_iso()
-        manifest.write_manifest(storage, m)
-        manifest.upsert_index_entry(storage, manifest.index_entry_from_manifest(m))
+        from datetime import datetime, timezone
+        with sync_session() as s:
+            RunsRepository(s).update_status(
+                run_id,
+                "failed",
+                error_message=f"ingest failed: {type(e).__name__}: {e}",
+                finished_at=datetime.now(timezone.utc),
+            )
         raise HTTPException(status_code=400, detail=str(e)) from e
 
-    episodes: list[dict[str, Any]] = []
+    # 3. Bulk-insert episodes + record artifact URI + recompute counts.
+    new_eps: list[NewEpisode] = []
     for ep in discovered.get(pipeline.GOLDEN_CATEGORY, []):
-        episodes.append(manifest.new_episode(pipeline.GOLDEN_CATEGORY, ep["name"], ep["trajectory_key"]))
+        new_eps.append(
+            NewEpisode(
+                category=pipeline.GOLDEN_CATEGORY,
+                name=ep["name"],
+                trajectory_uri=storage_uri_for(storage, ep["trajectory_key"]),
+            )
+        )
     for ep in discovered.get(pipeline.FAILURE_CATEGORY, []):
-        episodes.append(manifest.new_episode(pipeline.FAILURE_CATEGORY, ep["name"], ep["trajectory_key"]))
+        new_eps.append(
+            NewEpisode(
+                category=pipeline.FAILURE_CATEGORY,
+                name=ep["name"],
+                trajectory_uri=storage_uri_for(storage, ep["trajectory_key"]),
+            )
+        )
 
-    m["episodes"] = episodes
-    m["total_episodes"] = len(episodes)
-    m["golden_count"] = sum(1 for ep in episodes if ep["category"] == pipeline.GOLDEN_CATEGORY)
-    m["failure_count"] = sum(1 for ep in episodes if ep["category"] == pipeline.FAILURE_CATEGORY)
-    manifest.write_manifest(storage, m)
-    manifest.upsert_index_entry(storage, manifest.index_entry_from_manifest(m))
+    with sync_session() as s:
+        EpisodesRepository(s).bulk_insert(run_id, new_eps)
+        runs_repo = RunsRepository(s)
+        runs_repo.set_artifacts(
+            run_id,
+            original_zip_uri=storage_uri_for(storage, f"runs/{run_id.hex}/original.zip"),
+        )
+        runs_repo.recompute_counts(run_id)
+        run = runs_repo.get(run_id, with_episodes=False)
+        # snapshot scalars before the session closes
+        status = run.status if run else "queued"
+        total = run.total_episodes if run else 0
 
-    # Kick off background work.
     background.add_task(pipeline.process_run, run_id)
-    return {"run_id": run_id, "status": m["status"], "total_episodes": m["total_episodes"]}
+
+    return {
+        "run_id": run_id.hex,
+        "status": status,
+        "total_episodes": total,
+    }
 
 
 @router.get("/runs", dependencies=[Depends(require_token)])
-def list_runs(settings: Settings = Depends(get_settings)) -> list[dict[str, Any]]:
-    return manifest.read_index(get_storage(settings))
+async def list_runs(db: AsyncSession = Depends(get_db)) -> list[dict[str, Any]]:
+    repo = RunsRepositoryAsync(db)
+    runs = await repo.list(limit=200)
+    return [serializers.run_index_entry(r) for r in runs]
 
 
 @router.get("/runs/{run_id}", dependencies=[Depends(require_token)])
-def get_run(run_id: str, settings: Settings = Depends(get_settings)) -> dict[str, Any]:
-    storage = get_storage(settings)
-    if not storage.exists(manifest.manifest_key(run_id)):
+async def get_run(
+    run_id: str,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    rid = _coerce_run_uuid(run_id)
+    repo = RunsRepositoryAsync(db)
+    run = await repo.get(rid)
+    if run is None:
         raise HTTPException(status_code=404, detail="run not found")
-    return manifest.read_manifest(storage, run_id)
+    return serializers.run_manifest(run)
 
 
 @router.get("/runs/{run_id}/episodes/{episode_id}", dependencies=[Depends(require_token)])
-def get_episode_result(
-    run_id: str, episode_id: str, settings: Settings = Depends(get_settings)
+async def get_episode_result(
+    run_id: str,
+    episode_id: str,
+    settings: Settings = Depends(get_settings),
+    db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
-    storage = get_storage(settings)
-    m = manifest.read_manifest(storage, run_id)
-    ep = next((e for e in m["episodes"] if e["episode_id"] == episode_id), None)
-    if not ep:
+    rid = _coerce_run_uuid(run_id)
+    ep = await EpisodesRepositoryAsync(db).get(rid, episode_id)
+    if ep is None:
         raise HTTPException(status_code=404, detail="episode not found")
-    if not ep["result_key"]:
-        return {"status": ep["status"], "result": None, "error": ep.get("error_message", "")}
-    return {"status": ep["status"], "result": storage.get_json(ep["result_key"])}
+    if not ep.result_uri and ep.result is None:
+        return {"status": ep.status, "result": None, "error": ep.error_message or ""}
+    if ep.result is not None:
+        return {"status": ep.status, "result": ep.result}
+    # Backfilled rows may have result_uri but null result — read from storage.
+    storage = get_storage(settings)
+    return {"status": ep.status, "result": storage.get_json(key_from_uri(ep.result_uri))}
+
+
+def _download_blob(
+    storage_uri: str | None,
+    settings: Settings,
+    *,
+    missing_detail: str,
+    media_type: str,
+    filename: str,
+) -> Response:
+    if not storage_uri:
+        raise HTTPException(status_code=404, detail=missing_detail)
+    storage = get_storage(settings)
+    key = key_from_uri(storage_uri)
+    if not storage.exists(key):
+        raise HTTPException(status_code=404, detail=missing_detail)
+    return Response(
+        content=storage.get_bytes(key),
+        media_type=media_type,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @router.get("/runs/{run_id}/golden_summary.csv", dependencies=[Depends(require_token)])
-def download_golden(run_id: str, settings: Settings = Depends(get_settings)) -> Response:
-    storage = get_storage(settings)
-    key = f"{manifest.run_prefix(run_id)}/golden_summary.csv"
-    if not storage.exists(key):
-        raise HTTPException(status_code=404, detail="golden_summary.csv not yet available")
-    return Response(
-        content=storage.get_text(key),
+async def download_golden(
+    run_id: str,
+    settings: Settings = Depends(get_settings),
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    rid = _coerce_run_uuid(run_id)
+    run = await RunsRepositoryAsync(db).get(rid, with_episodes=False)
+    if run is None:
+        raise HTTPException(status_code=404, detail="run not found")
+    return _download_blob(
+        run.summary_csv_uri,
+        settings,
+        missing_detail="golden_summary.csv not yet available",
         media_type="text/csv",
-        headers={"Content-Disposition": f'attachment; filename="golden_summary_{run_id}.csv"'},
+        filename=f"golden_summary_{run_id}.csv",
     )
 
 
 @router.get("/runs/{run_id}/failure_summary.xlsx", dependencies=[Depends(require_token)])
-def download_failure(run_id: str, settings: Settings = Depends(get_settings)) -> Response:
-    storage = get_storage(settings)
-    key = f"{manifest.run_prefix(run_id)}/failure_summary.xlsx"
-    if not storage.exists(key):
-        raise HTTPException(status_code=404, detail="failure_summary.xlsx not yet available")
-    return Response(
-        content=storage.get_bytes(key),
+async def download_failure(
+    run_id: str,
+    settings: Settings = Depends(get_settings),
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    rid = _coerce_run_uuid(run_id)
+    run = await RunsRepositoryAsync(db).get(rid, with_episodes=False)
+    if run is None:
+        raise HTTPException(status_code=404, detail="run not found")
+    return _download_blob(
+        run.summary_xlsx_uri,
+        settings,
+        missing_detail="failure_summary.xlsx not yet available",
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f'attachment; filename="failure_summary_{run_id}.xlsx"'},
+        filename=f"failure_summary_{run_id}.xlsx",
+    )
+
+
+@router.get(
+    "/runs/{run_id}/episodes/{episode_id}/explorer.html",
+    dependencies=[Depends(require_token)],
+)
+async def download_episode_explorer(
+    run_id: str,
+    episode_id: str,
+    settings: Settings = Depends(get_settings),
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    rid = _coerce_run_uuid(run_id)
+    ep = await EpisodesRepositoryAsync(db).get(rid, episode_id)
+    if ep is None:
+        raise HTTPException(status_code=404, detail="episode not found")
+    return _download_blob(
+        ep.explorer_html_uri,
+        settings,
+        missing_detail="explorer.html not yet available",
+        media_type="text/html; charset=utf-8",
+        filename=f"{_safe_filename(ep.name, fallback=episode_id)}.html",
+    )
+
+
+@router.get(
+    "/runs/{run_id}/explorers.zip",
+    dependencies=[Depends(require_token)],
+)
+async def download_explorers_zip(
+    run_id: str,
+    settings: Settings = Depends(get_settings),
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    """Bundle every per-episode explorer.html for this run into a zip.
+
+    Layout inside the zip:  {category}/{episode_name}.html
+    """
+    rid = _coerce_run_uuid(run_id)
+    run = await RunsRepositoryAsync(db).get(rid)
+    if run is None:
+        raise HTTPException(status_code=404, detail="run not found")
+
+    storage = get_storage(settings)
+    seen_names: set[str] = set()
+    entries: list[tuple[str, bytes]] = []  # (zip_path, html_bytes)
+
+    for ep in run.episodes:
+        if not ep.explorer_html_uri:
+            continue
+        key = key_from_uri(ep.explorer_html_uri)
+        if not key or not storage.exists(key):
+            continue
+        category = _safe_filename(ep.category, fallback="episode")
+        base = _safe_filename(ep.name, fallback=ep.episode_key)
+        zip_path = f"{category}/{base}.html"
+        # Disambiguate collisions ({category}/{name}.html clashes are unlikely
+        # but possible after sanitization; suffix with the episode_key tail).
+        if zip_path in seen_names:
+            tail = ep.id.hex[:8]
+            zip_path = f"{category}/{base}__{tail}.html"
+        seen_names.add(zip_path)
+        try:
+            entries.append((zip_path, storage.get_bytes(key)))
+        except Exception:  # noqa: BLE001
+            log.exception("could not read explorer for episode %s", ep.episode_key)
+
+    if not entries:
+        raise HTTPException(
+            status_code=404,
+            detail="no per-episode explorer.html files available yet",
+        )
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+        for path, data in entries:
+            zf.writestr(path, data)
+
+    zip_filename = f"explorers_{_safe_filename(run.task_name, fallback=run_id)}.zip"
+    return Response(
+        content=buf.getvalue(),
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{zip_filename}"'},
     )
 
 
 @router.delete("/runs/{run_id}", dependencies=[Depends(require_token)])
-def delete_run(run_id: str, settings: Settings = Depends(get_settings)) -> dict[str, Any]:
+async def delete_run(
+    run_id: str,
+    settings: Settings = Depends(get_settings),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    rid = _coerce_run_uuid(run_id)
+    repo = RunsRepositoryAsync(db)
+    deleted = await repo.delete(rid)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="run not found")
+    await db.commit()
     storage = get_storage(settings)
-    storage.delete_prefix(manifest.run_prefix(run_id))
-    manifest.remove_index_entry(storage, run_id)
+    storage.delete_prefix(f"runs/{rid.hex}")
     return {"deleted": run_id}
 
 
 @router.post("/runs/{run_id}/pause", dependencies=[Depends(require_token)])
-def pause_run(run_id: str, settings: Settings = Depends(get_settings)) -> dict[str, Any]:
-    """Signal the worker for this run to stop scheduling new episodes.
-
-    In-flight LLM calls finish (no mid-call cancel). Once they finish, the
-    run lands in status='paused' and waits for /resume.
-    """
-    storage = get_storage(settings)
-    if not storage.exists(manifest.manifest_key(run_id)):
+async def pause_run(
+    run_id: str,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    rid = _coerce_run_uuid(run_id)
+    repo = RunsRepositoryAsync(db)
+    run = await repo.get(rid, with_episodes=False)
+    if run is None:
         raise HTTPException(status_code=404, detail="run not found")
-    m = manifest.read_manifest(storage, run_id)
-    if m["status"] in ("done", "failed"):
-        return {"run_id": run_id, "status": m["status"], "noop": True}
-
-    pipeline.request_pause(run_id)
-    m["pause_requested"] = True
-    # If the worker is mid-execution we mark "pausing"; if it hasn't started
-    # yet (queued / paused), it stays where it is until process_run reads it.
-    if m["status"] == "running":
-        m["status"] = "pausing"
-    manifest.write_manifest(storage, m)
-    manifest.upsert_index_entry(storage, manifest.index_entry_from_manifest(m))
-    return {"run_id": run_id, "status": m["status"]}
+    if run.status in ("done", "failed"):
+        return {"run_id": run_id, "status": run.status, "noop": True}
+    run = await repo.set_pause(rid, True)
+    assert run is not None
+    await db.commit()
+    return {"run_id": run_id, "status": run.status}
 
 
 @router.post("/runs/{run_id}/resume", dependencies=[Depends(require_token)])
-def resume_run(
+async def resume_run(
     run_id: str,
     background: BackgroundTasks,
-    settings: Settings = Depends(get_settings),
+    db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
-    """Clear the pause flag and re-schedule the worker."""
-    storage = get_storage(settings)
-    if not storage.exists(manifest.manifest_key(run_id)):
+    rid = _coerce_run_uuid(run_id)
+    repo = RunsRepositoryAsync(db)
+    run = await repo.get(rid, with_episodes=False)
+    if run is None:
         raise HTTPException(status_code=404, detail="run not found")
-    m = manifest.read_manifest(storage, run_id)
-    if m["status"] in ("done", "failed"):
-        return {"run_id": run_id, "status": m["status"], "noop": True}
-
-    pipeline.request_resume(run_id)
-    m["pause_requested"] = False
-    if m["status"] in ("paused", "pausing"):
-        m["status"] = "queued"
-    manifest.write_manifest(storage, m)
-    manifest.upsert_index_entry(storage, manifest.index_entry_from_manifest(m))
-
-    background.add_task(pipeline.process_run, run_id)
-    return {"run_id": run_id, "status": m["status"]}
+    if run.status in ("done", "failed"):
+        return {"run_id": run_id, "status": run.status, "noop": True}
+    run = await repo.set_pause(rid, False)
+    assert run is not None
+    await db.commit()
+    background.add_task(pipeline.process_run, rid)
+    return {"run_id": run_id, "status": run.status}

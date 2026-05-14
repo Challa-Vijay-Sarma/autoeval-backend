@@ -37,6 +37,25 @@ class Settings(BaseSettings):
     # Parallelism for ingest writes (one bucket object per write). Higher = faster
     # zip → bucket extraction on slow buckets (Rapid / HNS).
     ingest_parallelism: int = 16
+    # Parallelism for staging the run prefix back from the bucket (used by the
+    # explorer step). Higher = faster end-of-run packaging on slow buckets.
+    stage_parallelism: int = 16
+
+    # Explorer — self-contained HTML bundle written at end of each run.
+    # Path is resolved relative to project_root() (i.e. backend/).
+    explorer_template_path: str = "templates/explorer_template.html"
+    # Files larger than this are replaced with a placeholder in the explorer.
+    explorer_max_file_bytes: int = 5_000_000
+
+    # Postgres state layer
+    # Async URL (postgresql+asyncpg://...) used by FastAPI routes.
+    # Sync URL (postgresql+psycopg://...) used by the background worker and Alembic.
+    database_url: str = ""
+    database_url_sync: str = ""
+    db_pool_size: int = 5
+    db_max_overflow: int = 10
+    # Episodes left "running" longer than this are considered stale (worker crash).
+    episode_stale_after_seconds: int = 900
 
     # Auth
     api_token: str = ""  # empty -> open access

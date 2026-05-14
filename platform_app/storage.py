@@ -239,6 +239,35 @@ class GCSStorage:
 
 
 # ----------------------------------------------------------------------------
+# URI helpers
+# ----------------------------------------------------------------------------
+def storage_uri_for(storage: StorageBackend, key: str) -> str:
+    """Return a stable, backend-aware URI for a stored object.
+
+    - GCS:   gs://<bucket>/<key>
+    - Local: local://<key>     (key is bucket-relative; resolves under storage_local_dir)
+
+    The URI is what we persist in Postgres so we can round-trip back to the
+    storage backend later without coupling DB rows to a specific backend.
+    """
+    if isinstance(storage, GCSStorage):
+        return f"gs://{storage._bucket_name}/{key}"
+    return f"local://{key}"
+
+
+def key_from_uri(uri: str) -> str:
+    """Inverse of storage_uri_for — return the bucket-relative key only."""
+    if uri.startswith("gs://"):
+        rest = uri[len("gs://"):]
+        # Strip the bucket name → keep the key
+        slash = rest.find("/")
+        return rest[slash + 1:] if slash >= 0 else ""
+    if uri.startswith("local://"):
+        return uri[len("local://"):]
+    return uri  # fallback: treat as already-key
+
+
+# ----------------------------------------------------------------------------
 # Factory
 # ----------------------------------------------------------------------------
 def get_storage(settings: Settings | None = None) -> StorageBackend:
@@ -253,19 +282,37 @@ def get_storage(settings: Settings | None = None) -> StorageBackend:
 # ----------------------------------------------------------------------------
 # Helper: stage a remote file/prefix locally for tools that need a real path
 # ----------------------------------------------------------------------------
-def stage_to_tempdir(storage: StorageBackend, prefix: str) -> Path:
+def stage_to_tempdir(
+    storage: StorageBackend,
+    prefix: str,
+    *,
+    parallelism: int | None = None,
+) -> Path:
     """Download every key under `prefix` to a temp dir; return the temp dir.
 
     For LocalStorage this just returns the directory directly (no copy).
     Caller is responsible for cleanup unless using LocalStorage.
+
+    Downloads run in parallel — important on slow buckets (Rapid / HNS) where
+    each per-object fetch is the bottleneck. `parallelism` defaults to
+    Settings.stage_parallelism (16).
     """
     if isinstance(storage, LocalStorage):
         return storage.root / prefix
+
+    pool_size = parallelism if parallelism is not None else max(1, get_settings().stage_parallelism)
     tmp = Path(tempfile.mkdtemp(prefix="autoeval-"))
-    for key in storage.list_prefix(prefix):
+    keys = list(storage.list_prefix(prefix))
+
+    def _download(key: str) -> None:
         rel = key[len(prefix):].lstrip("/")
         dest = tmp / rel
         dest.parent.mkdir(parents=True, exist_ok=True)
         with storage.stream_readable(key) as src, open(dest, "wb") as dst:
             shutil.copyfileobj(src, dst)
+
+    if keys:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=pool_size) as pool:
+            # list(pool.map(...)) so we surface any per-key exception.
+            list(pool.map(_download, keys))
     return tmp

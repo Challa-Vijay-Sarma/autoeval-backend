@@ -99,11 +99,35 @@ See [`.env.example`](.env.example). Summary:
 
 ## Local dev
 
+### Docker (recommended)
+
+Runs the API in the **Python 3.13** image from [`Dockerfile`](Dockerfile) with pinned `requirements.txt`, so you avoid host Python mismatches (for example **Python 3.14** with older SQLAlchemy breaking ORM mapper setup). The container entrypoint runs **`alembic upgrade head`** then **`uvicorn`** on port **8000**.
+
+1. `cp .env.example .env` and set **`OPENAI_API_KEY`**, storage vars, etc. For Compose, keep **`DATABASE_URL`** / **`DATABASE_URL_SYNC`** pointed at the **`postgres`** service (hostname `postgres`, port **5432**), as in `.env.example`.
+2. [`docker-compose.yml`](docker-compose.yml) mounts a host path for **GCS** credentials. If you use **`STORAGE_BACKEND=local`** only, remove or adjust the **`backend`** service **`volumes`** and **`GOOGLE_APPLICATION_CREDENTIALS`** override so the container starts on your machine.
+3. From `backend/`:
+
+```bash
+docker compose up --build -d
+```
+
+API: **http://localhost:8000**. Stop with `docker compose down`.
+
+Pair with the frontend: `cd ../frontend && npm run dev` → **http://localhost:5173** (leave **`VITE_API_BASE_URL`** empty so Vite proxies `/api` to `:8000`).
+
+### Host `uvicorn` (optional)
+
+For fast iteration with **`--reload`** without rebuilding the Docker image:
+
 ```bash
 cd backend
 cp .env.example .env             # fill OPENAI_API_KEY
+# Point DATABASE_URL* at Postgres reachable from the host (e.g. localhost:5433 if only the compose postgres service is up with ports "5433:5432")
+pip install -r requirements.txt  # or: uv pip install --python .venv/bin/python3 -r requirements.txt
 .venv/bin/python3 -m uvicorn platform_app.main:app --reload --port 8000
 ```
+
+If the host interpreter is **Python 3.14**, run **`pip install --upgrade -r requirements.txt`** first so **SQLAlchemy ≥ 2.0.42** is installed (see comment in `requirements.txt`).
 
 Smoke test:
 
@@ -112,7 +136,7 @@ curl -s http://localhost:8000/api/health     # -> {"status":"ok"}
 curl -s http://localhost:8000/api/runs       # -> []
 ```
 
-`pydantic-settings` is `lru_cache`-d in [`config.py`](platform_app/config.py); changes to `.env` need a full **process restart** (Ctrl+C and start again) — `--reload` alone won't clear the cache.
+`pydantic-settings` is `lru_cache`-d in [`config.py`](platform_app/config.py); changes to `.env` need a full **process restart** (Ctrl+C and start again) — `--reload` alone won't clear the cache. After editing `.env` for the **Docker** backend, recreate the container: `docker compose up --build -d`.
 
 ---
 

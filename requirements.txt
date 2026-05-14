@@ -13,3 +13,9 @@ grpc-google-iam-v1>=0.13
 # gRPC runtime for the appendable / Rapid / HNS bucket code path in platform_app.storage
 grpcio>=1.60
 grpcio-status>=1.60
+# Postgres state layer
+# SQLAlchemy <2.0.42 breaks on Python 3.14 (Union[...].__getitem__(tuple) TypeError).
+sqlalchemy[asyncio]>=2.0.42
+asyncpg>=0.29
+psycopg[binary]>=3.1
+alembic>=1.13
