@@ -289,9 +289,9 @@ Local backend writes under `STORAGE_LOCAL_DIR`; GCS backend writes into `gs://$G
 
 Plus per-trajectory `SC1..SC4 ∈ {PASS, FAIL, WEAK PASS, NA}`, three boolean hard-requirement flags, and a final verdict `ACCEPT as Golden Trajectory | BORDERLINE | REJECT`.
 
-### Failure — 9-category classification + GT shape
+### Failure — 8-category classification + GT shape
 
-9-category labels: `Disobey Specification, Step Repetition, Unaware of termination conditions, Reasoning-Action Mismatch, Context Loss, Task Derailment, Premature termination, No or incorrect Verification, Weak Verification`.
+8-category labels (verbatim): `Disobey Task Specification, Step Repetition, Unaware of Termination Conditions, Context Loss, Premature Termination, No or Irrelevant Verification, Reasoning-Action Mismatch, Weak Verification`. Each category in the prompt carries a Framing block + a step-by-step Decision Procedure; the model is asked to apply each procedure and emit the single category with the strongest MATCH.
 
 Each failure episode also receives a GT-class label + 1-sentence justification (only those two — SC1..SC4, verdict, and hard requirements are intentionally dropped for failures).
 
