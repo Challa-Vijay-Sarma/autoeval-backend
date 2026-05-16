@@ -65,17 +65,36 @@ def _appendable_put_sync(bucket_name: str, object_name: str, data: bytes) -> Non
 
     async def _run() -> None:
         grpc_cli = AsyncGrpcClient()
-        writer = AsyncAppendableObjectWriter(
-            grpc_cli,
-            bucket_name,
-            object_name,
-            generation=None,
-        )
-        await writer.open()
-        if data:
-            await writer.append(data)
-        await writer.flush()
-        await writer.close(finalize_on_close=True)
+        try:
+            writer = AsyncAppendableObjectWriter(
+                grpc_cli,
+                bucket_name,
+                object_name,
+                generation=None,
+            )
+            await writer.open()
+            if data:
+                await writer.append(data)
+            await writer.flush()
+            await writer.close(finalize_on_close=True)
+        finally:
+            # Drain the gRPC client's background stream tasks before the event
+            # loop closes. Without this, asyncio.run() tears the loop down with
+            # pending `_consume_request_iterator` tasks and logs noisy warnings
+            # ("Task was destroyed but it is pending!"). Different versions of
+            # google-cloud-storage expose this method under different names; try
+            # the common ones in order and swallow failures (best-effort cleanup).
+            for fn_name in ("close", "aclose"):
+                fn = getattr(grpc_cli, fn_name, None)
+                if not callable(fn):
+                    continue
+                try:
+                    res = fn()
+                    if asyncio.iscoroutine(res):
+                        await res
+                    break
+                except Exception:  # noqa: BLE001
+                    log.debug("AsyncGrpcClient.%s() failed; ignored", fn_name, exc_info=True)
 
     try:
         asyncio.get_running_loop()

@@ -109,7 +109,12 @@ def _upsert_run(
         finished_at=manifest_finished,
         original_zip_uri=_key_if_exists(storage, f"{run_pfx}/original.zip"),
         summary_csv_uri=_key_if_exists(storage, f"{run_pfx}/golden_summary.csv"),
-        summary_xlsx_uri=_key_if_exists(storage, f"{run_pfx}/failure_summary.xlsx"),
+        # Prefer the new .csv path; fall back to historical .xlsx (pre-CSV runs).
+        # DB column is still called summary_xlsx_uri for historical reasons.
+        summary_xlsx_uri=(
+            _key_if_exists(storage, f"{run_pfx}/failure_summary.csv")
+            or _key_if_exists(storage, f"{run_pfx}/failure_summary.xlsx")
+        ),
         explorer_html_uri=_key_if_exists(storage, f"{run_pfx}/explorer.html"),
     )
 

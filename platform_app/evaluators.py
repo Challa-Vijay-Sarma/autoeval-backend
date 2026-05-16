@@ -55,6 +55,7 @@ def golden_summary_row(
     agent: str,
     model: str,
     trajectory_name: str,
+    explorer_path: str = "",
 ) -> dict[str, Any]:
     gt_block = result.get("gt_class") or {}
     task_name = task.split("/")[-1] if task else trajectory_name
@@ -70,6 +71,7 @@ def golden_summary_row(
         "HITL Remarks": "",
         "Task name": task_name,
         "Trajectory name": trajectory_name,
+        "Explorer HTML": explorer_path,
     }
 
 
@@ -107,9 +109,11 @@ def failure_summary_row(
     status: str,
     gt_class: str = "",
     gt_justification: str = "",
+    explorer_path: str = "",
 ) -> dict[str, Any]:
-    """Compact row that matches the columns of the CLI failure_summary.xlsx,
-    plus the GT-class label + 1-sentence justification we run on failures."""
+    """Compact row that matches the columns of failure_summary.csv,
+    plus the GT-class label + 1-sentence justification we run on failures, plus
+    the relative path of the per-episode explorer HTML inside results.zip."""
     res = eval_out.get("result", {}) or {}
     return {
         "agent": agent,
@@ -122,6 +126,7 @@ def failure_summary_row(
         "reason": res.get("reason", ""),
         "root_cause": res.get("root_cause", ""),
         "fix": res.get("fix", ""),
+        "Explorer HTML": explorer_path,
     }
 
 

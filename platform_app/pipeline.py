@@ -22,8 +22,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import pandas as pd
-
 from . import evaluators
 from .config import get_settings
 from .db import sync_session
@@ -388,6 +386,13 @@ def _process_episode(
     else:
         result_path_parts = parts[:-1]
 
+    # Predict where this episode's HTML will land inside the results.zip bundle.
+    # The bundle layout is `{category}/{safe(name)}.html`; the path is
+    # deterministic from (category, name) so we can write it into the summary
+    # row even before the explorer daemon thread has produced the HTML.
+    from .naming import safe_filename as _safe_filename
+    explorer_path = f"{category}/{_safe_filename(ep_name)}.html"
+
     if category == GOLDEN_CATEGORY:
         result = evaluators.evaluate_golden(client, trajectory, model, max_tokens)
         result_key = "/".join(result_path_parts + ["eval_golden.json"])
@@ -398,6 +403,7 @@ def _process_episode(
             agent=meta["agent"],
             model=meta["model"] or run_model,
             trajectory_name=trajectory_key,
+            explorer_path=explorer_path,
         )
     else:
         failure_output = _maybe_read(storage, f"{ep_dir}/verifier/test-stdout.txt", limit=1000)
@@ -432,6 +438,7 @@ def _process_episode(
             status="fail",
             gt_class=gt_class,
             gt_justification=gt_justification,
+            explorer_path=explorer_path,
         )
 
     return EpisodeOutcome(
@@ -459,12 +466,14 @@ GOLDEN_COLUMNS = [
     "GT Class(AI)", "GT Justification(AI)", "Success Criteria (AI)",
     "GT Class(Human)", "Success Criteria (Human)",
     "HITL Remarks", "Task name", "Trajectory name",
+    "Explorer HTML",
 ]
 
 FAILURE_COLUMNS = [
     "agent", "benchmark", "trial_id", "status",
     "GT Class(AI)", "GT Justification(AI)",
     "failure_type", "reason", "root_cause", "fix",
+    "Explorer HTML",
 ]
 
 
@@ -491,13 +500,13 @@ def _write_summaries(storage: StorageBackend, run: Run, episodes: list) -> None:
         )
 
     if failure_rows:
-        df = pd.DataFrame(failure_rows, columns=FAILURE_COLUMNS)
-        buf = io.BytesIO()
-        df.to_excel(buf, index=False)
-        storage.put_bytes(
-            f"{run_pfx}/failure_summary.xlsx",
-            buf.getvalue(),
-            content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        buf = io.StringIO()
+        writer = csv.DictWriter(buf, fieldnames=FAILURE_COLUMNS)
+        writer.writeheader()
+        for row in failure_rows:
+            writer.writerow({k: row.get(k, "") for k in FAILURE_COLUMNS})
+        storage.put_text(
+            f"{run_pfx}/failure_summary.csv", buf.getvalue(), content_type="text/csv"
         )
 
 
@@ -508,11 +517,13 @@ def _record_summary_uris(
     episodes: list,
 ) -> None:
     run_pfx = run_prefix(rid)
-    csv_key = f"{run_pfx}/golden_summary.csv"
-    xlsx_key = f"{run_pfx}/failure_summary.xlsx"
+    golden_key = f"{run_pfx}/golden_summary.csv"
+    # NB: the DB column `summary_xlsx_uri` is a legacy name; now holds the path
+    # to the failure CSV (the file is no longer an .xlsx).
+    failure_key = f"{run_pfx}/failure_summary.csv"
     zip_key = f"{run_pfx}/original.zip"
-    csv_uri = storage_uri_for(storage, csv_key) if storage.exists(csv_key) else None
-    xlsx_uri = storage_uri_for(storage, xlsx_key) if storage.exists(xlsx_key) else None
+    csv_uri = storage_uri_for(storage, golden_key) if storage.exists(golden_key) else None
+    xlsx_uri = storage_uri_for(storage, failure_key) if storage.exists(failure_key) else None
     zip_uri = storage_uri_for(storage, zip_key) if storage.exists(zip_key) else None
     runs_repo.set_artifacts(
         rid,

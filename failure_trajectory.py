@@ -632,7 +632,7 @@ def main() -> None:
     failure_analysis["context"] = failure_analysis.apply(build_context, axis=1)
 
     all_outputs: list[dict[str, Any]] = []
-    summary_path = args.base_dir / "failure_summary.xlsx"
+    summary_path = args.base_dir / "failure_summary.csv"
 
     for start in range(0, len(failure_analysis), BATCH_SIZE):
         end = start + BATCH_SIZE
@@ -668,12 +668,12 @@ def _write_summary(df: pd.DataFrame, out_path: Path) -> None:
     for col in columns:
         if col not in out.columns:
             out[col] = ""
-    # Serialize dict/list cells so Excel can hold them
+    # Serialize dict/list cells so CSV can hold them
     for col in ("trajectory", "context", "llm_output"):
         out[col] = out[col].apply(
             lambda v: json.dumps(v, ensure_ascii=False) if isinstance(v, (dict, list)) else v
         )
-    out[columns].to_excel(out_path, index=False)
+    out[columns].to_csv(out_path, index=False)
 
 
 if __name__ == "__main__":

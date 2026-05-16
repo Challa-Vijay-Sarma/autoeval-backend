@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import io
 import logging
-import re
 import uuid
 import zipfile
 from typing import Any
@@ -47,16 +46,7 @@ def require_token(
         raise HTTPException(status_code=401, detail="invalid or missing bearer token")
 
 
-_FILENAME_SAFE = re.compile(r"[^A-Za-z0-9._-]+")
-
-
-def _safe_filename(name: str, *, fallback: str = "episode") -> str:
-    """Sanitize a name for use in a Content-Disposition or zip entry path.
-
-    Strips path separators and any non-[A-Za-z0-9._-] runs, collapses to "_".
-    """
-    cleaned = _FILENAME_SAFE.sub("_", name).strip("._-")
-    return cleaned or fallback
+from .naming import safe_filename as _safe_filename  # re-exported for backwards-compat
 
 
 def _coerce_run_uuid(run_id: str) -> uuid.UUID:
@@ -233,12 +223,14 @@ async def download_golden(
     )
 
 
-@router.get("/runs/{run_id}/failure_summary.xlsx", dependencies=[Depends(require_token)])
+@router.get("/runs/{run_id}/failure_summary.csv", dependencies=[Depends(require_token)])
 async def download_failure(
     run_id: str,
     settings: Settings = Depends(get_settings),
     db: AsyncSession = Depends(get_db),
 ) -> Response:
+    """Failure summary is now CSV (was XLSX). The DB column is still called
+    `summary_xlsx_uri` for historical reasons; it holds the CSV path."""
     rid = _coerce_run_uuid(run_id)
     run = await RunsRepositoryAsync(db).get(rid, with_episodes=False)
     if run is None:
@@ -246,10 +238,21 @@ async def download_failure(
     return _download_blob(
         run.summary_xlsx_uri,
         settings,
-        missing_detail="failure_summary.xlsx not yet available",
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        filename=f"failure_summary_{run_id}.xlsx",
+        missing_detail="failure_summary.csv not yet available",
+        media_type="text/csv",
+        filename=f"failure_summary_{run_id}.csv",
     )
+
+
+# Legacy alias — old clients hitting /failure_summary.xlsx get a 302.
+@router.get(
+    "/runs/{run_id}/failure_summary.xlsx",
+    dependencies=[Depends(require_token)],
+    include_in_schema=False,
+)
+async def download_failure_xlsx_legacy(run_id: str) -> Response:
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(url=f"/api/runs/{run_id}/failure_summary.csv", status_code=302)
 
 
 @router.get(
@@ -276,27 +279,74 @@ async def download_episode_explorer(
 
 
 @router.get(
-    "/runs/{run_id}/explorers.zip",
+    "/runs/{run_id}/results.zip",
     dependencies=[Depends(require_token)],
 )
-async def download_explorers_zip(
+async def download_results_zip(
     run_id: str,
     settings: Settings = Depends(get_settings),
     db: AsyncSession = Depends(get_db),
 ) -> Response:
-    """Bundle every per-episode explorer.html for this run into a zip.
+    """Single-click bundle: golden/failure summaries + every per-episode HTML.
 
-    Layout inside the zip:  {category}/{episode_name}.html
+    Layout inside the zip:
+        golden_summary.csv          (when available)
+        failure_summary.csv         (when available)
+        golden/<safe(name)>.html    (per episode, when its HTML is ready)
+        failure/<safe(name)>.html
+
+    The "Explorer HTML" column in each summary spreadsheet matches the
+    `{category}/<safe(name)>.html` path so users can jump from a CSV row to
+    its HTML without scanning filenames.
     """
     rid = _coerce_run_uuid(run_id)
     run = await RunsRepositoryAsync(db).get(rid)
     if run is None:
         raise HTTPException(status_code=404, detail="run not found")
 
+    # Ensure every "done" episode has a per-episode HTML before we bundle.
+    # This handles two cases:
+    #   1. The user downloads immediately after the run flipped to "done", before
+    #      the background explorer-daemon thread has finished its loop.
+    #   2. Historical runs that finished before the per-episode explorer feature
+    #      existed — explorer_html_uri is NULL on those rows.
+    # The generation is idempotent: episodes that already have an HTML are
+    # skipped inside _write_run_episode_explorers' per-episode worker (because
+    # storage.put_bytes overwrites). For large runs this may take a few seconds.
+    missing_html = any(
+        ep.status == "done" and not ep.explorer_html_uri for ep in run.episodes
+    )
+    if missing_html:
+        from . import pipeline
+        log.info("results.zip: generating missing per-episode HTMLs for %s", run_id)
+        await run_in_threadpool(pipeline._write_run_episode_explorers, rid)
+        # Re-load the run so we see the newly-set explorer_html_uri values.
+        await db.expire_all()
+        run = await RunsRepositoryAsync(db).get(rid)
+        if run is None:  # pragma: no cover — would have raised earlier
+            raise HTTPException(status_code=404, detail="run not found")
+
     storage = get_storage(settings)
     seen_names: set[str] = set()
-    entries: list[tuple[str, bytes]] = []  # (zip_path, html_bytes)
+    entries: list[tuple[str, bytes]] = []  # (zip_path, bytes)
 
+    # 1. Summary spreadsheets (best-effort; absent if the run isn't done yet)
+    # summary_xlsx_uri is a legacy column name; it now points at a CSV.
+    for uri, zip_name in (
+        (run.summary_csv_uri, "golden_summary.csv"),
+        (run.summary_xlsx_uri, "failure_summary.csv"),
+    ):
+        if not uri:
+            continue
+        key = key_from_uri(uri)
+        if not key or not storage.exists(key):
+            continue
+        try:
+            entries.append((zip_name, storage.get_bytes(key)))
+        except Exception:  # noqa: BLE001
+            log.exception("could not read %s for run %s", zip_name, run_id)
+
+    # 2. Per-episode explorer HTMLs
     for ep in run.episodes:
         if not ep.explorer_html_uri:
             continue
@@ -307,7 +357,7 @@ async def download_explorers_zip(
         base = _safe_filename(ep.name, fallback=ep.episode_key)
         zip_path = f"{category}/{base}.html"
         # Disambiguate collisions ({category}/{name}.html clashes are unlikely
-        # but possible after sanitization; suffix with the episode_key tail).
+        # but possible after sanitization; suffix with the episode id tail).
         if zip_path in seen_names:
             tail = ep.id.hex[:8]
             zip_path = f"{category}/{base}__{tail}.html"
@@ -320,7 +370,7 @@ async def download_explorers_zip(
     if not entries:
         raise HTTPException(
             status_code=404,
-            detail="no per-episode explorer.html files available yet",
+            detail="no results available yet — try again once the run finishes",
         )
 
     buf = io.BytesIO()
@@ -328,12 +378,25 @@ async def download_explorers_zip(
         for path, data in entries:
             zf.writestr(path, data)
 
-    zip_filename = f"explorers_{_safe_filename(run.task_name, fallback=run_id)}.zip"
+    zip_filename = (
+        f"results_{_safe_filename(run.task_name, fallback=run_id)}_{rid.hex[:8]}.zip"
+    )
     return Response(
         content=buf.getvalue(),
         media_type="application/zip",
         headers={"Content-Disposition": f'attachment; filename="{zip_filename}"'},
     )
+
+
+# Legacy alias — old clients hitting /explorers.zip get a 302 to /results.zip.
+@router.get(
+    "/runs/{run_id}/explorers.zip",
+    dependencies=[Depends(require_token)],
+    include_in_schema=False,
+)
+async def download_explorers_zip_legacy(run_id: str) -> Response:
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(url=f"/api/runs/{run_id}/results.zip", status_code=302)
 
 
 @router.delete("/runs/{run_id}", dependencies=[Depends(require_token)])
